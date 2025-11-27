@@ -1162,7 +1162,7 @@ FOUND_FILE="${TEMP_DIR}/found_packages.txt"
 cut -f1 "$INSTALLED_PACKAGES_FILE" | fgrep -xf "$MALICIOUS_LIST_FILE" > "${TEMP_DIR}/matched_keys.txt" 2>/dev/null || true
 
 # For each matched key, find the full line with path and output JSON
-if [ -s "${TEMP_DIR}/kandji_matched_keys.txt" ]; then
+if [ -s "${TEMP_DIR}/matched_keys.txt" ]; then
     while IFS= read -r matched_key; do
         # Find the line with this key in installed packages
         pkg_line=$(grep -F "$matched_key	" "$INSTALLED_PACKAGES_FILE" | head -1)
