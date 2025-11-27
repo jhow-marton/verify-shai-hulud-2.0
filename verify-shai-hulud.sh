@@ -5,7 +5,10 @@
 SCAN_DIRS="/Users /Applications /opt /var"
 
 # Maximum depth to search (prevents excessive scan times)
-MAX_DEPTH=10
+MAX_DEPTH=25
+
+# Search strategy: 'lockfile' (faster, checks package-lock.json) or 'installed' (slower, checks node_modules)
+SEARCH_MODE="${SEARCH_MODE:-lockfile}"
 
 # --- Embedded Package List (Package:Version format) ---
 # Generated from Public Sha1-Hulud - Koi.csv
@@ -1065,6 +1068,27 @@ zapier-scripts:7.8.4
 zuper-cli:1.0.1
 zuper-sdk:1.0.57
 zuper-stream:2.0.9
+@everreal/validate-esmoduleinterop-imports:1.4.4
+@mizzle-dev/orm:0.0.2
+@postman/tunnel-agent:0.6.6
+@voiceflow/commitlint-config:2.6.2
+@voiceflow/git-branch-check:1.4.4
+@voiceflow/husky-config:1.3.2
+@voiceflow/nestjs-timeout:1.3.2
+@voiceflow/prettier-config:1.10.2
+@voiceflow/secrets-provider:1.9.3
+@voiceflow/semantic-release-config:1.4.2
+@voiceflow/stylelint-config:1.1.2
+@voiceflow/tsconfig:1.12.2
+@voiceflow/verror:1.1.5
+babel-preset-kinvey-flex-service:0.1.1
+better-queue-nedb:0.1.5
+create-kinvey-flex-service:0.2.1
+electron-volt:0.0.2
+eslint-config-kinvey-flex-service:0.1.1
+kinvey-cli-wrapper:0.3.1
+kinvey-flex-scripts:0.5.1
+undefsafe-typed:1.0.3
 PACKAGES_EOF
 
 # --- Helper Functions ---
@@ -1082,66 +1106,190 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
 }
 
+# Parse package-lock.json for dependencies (faster method)
+parse_lockfile() {
+    lockfile_path="$1"
+    project_path=$(dirname "$lockfile_path")
+
+    # Extract all package:version pairs from lockfile using awk
+    # This is much faster than parsing node_modules
+    # Compatible with both GNU awk and BSD awk (macOS)
+    awk -v project="$project_path" '
+    BEGIN {
+        in_packages = 0
+        current_pkg = ""
+    }
+
+    # Handle package-lock.json v1, v2, and v3 formats
+    /"(packages|dependencies)"[[:space:]]*:[[:space:]]*{/ {
+        in_packages = 1
+        next
+    }
+
+    # Match package name (handles both "node_modules/@scope/pkg" and direct names)
+    in_packages && /"[^"]*"[[:space:]]*:[[:space:]]*{/ {
+        # Extract package name from quoted string
+        if (match($0, /"([^"]+)"[[:space:]]*:[[:space:]]*{/)) {
+            pkg_line = $0
+            # Remove everything before the first quote
+            sub(/^[^"]*"/, "", pkg_line)
+            # Remove everything after the closing quote
+            sub(/".*$/, "", pkg_line)
+            # Remove node_modules/ prefix if present
+            sub(/^node_modules\//, "", pkg_line)
+            current_pkg = pkg_line
+        }
+        next
+    }
+
+    # Match version within a package block
+    in_packages && current_pkg != "" && /"version"[[:space:]]*:[[:space:]]*"/ {
+        if (match($0, /"version"[[:space:]]*:[[:space:]]*"([^"]+)"/)) {
+            version_line = $0
+            sub(/^[^"]*"version"[[:space:]]*:[[:space:]]*"/, "", version_line)
+            sub(/".*$/, "", version_line)
+            version = version_line
+            if (version != "" && current_pkg != "") {
+                print current_pkg ":" version "\t" project
+            }
+            current_pkg = ""
+        }
+        next
+    }
+
+    # Reset on closing brace at top level
+    /^[[:space:]]*}[[:space:]]*$/ {
+        current_pkg = ""
+    }
+    ' "$lockfile_path" 2>/dev/null
+}
+
+# Parse package.json for dependencies (fallback if no lockfile)
+parse_package_json() {
+    pkg_json="$1"
+    project_path=$(dirname "$pkg_json")
+
+    # Extract dependencies and devDependencies - version-agnostic approach
+    awk -F'"' '
+    /"(dependencies|devDependencies)"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/ {
+        if ($2 != "" && $4 != "" && $2 !~ /(dependencies|devDependencies)/) {
+            # Clean version string (remove ^, ~, >=, etc.)
+            version = $4
+            gsub(/[\^~>=<]/, "", version)
+            # Remove version ranges like "1.0.0 - 2.0.0"
+            if (index(version, " - ") > 0) {
+                split(version, parts, " - ")
+                version = parts[1]
+            }
+            # Remove ||, spaces, and take first version
+            gsub(/ ?\|\| ?/, " ", version)
+            split(version, versions, " ")
+            version = versions[1]
+
+            if (version != "" && version !~ /^(http|git|file|latest|workspace|\*)/) {
+                print $2 ":" version "\t" "'"$project_path"'"
+            }
+        }
+    }
+    ' "$pkg_json" 2>/dev/null
+}
+
 # --- Main Logic ---
 
 # Get machine identifier
-SERIAL_NUMBER=$(/usr/sbin/ioreg -l | grep IOPlatformSerialNumber | sed 's/.*"\(.*\)"/\1/')
+SERIAL_NUMBER=$(/usr/sbin/ioreg -l | grep IOPlatformSerialNumber | sed 's/.*"\(.*\)"/\1/' 2>/dev/null || echo "unknown")
 HOSTNAME=$(hostname)
 SCAN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # Write malicious packages list to temp file for fast grep lookup
 TEMP_DIR="${TMPDIR:-/tmp}"
-MALICIOUS_LIST_FILE="${TEMP_DIR}/malicious_list.txt"
+MALICIOUS_LIST_FILE="${TEMP_DIR}/malicious_list_$$.txt"
 echo "$PACKAGE_LIST" > "$MALICIOUS_LIST_FILE"
 
-# Find all node_modules directories
-# Use -prune to skip searching inside node_modules and other unneeded directories
-NODE_MODULES_FILE="${TEMP_DIR}/node_modules.txt"
-: > "$NODE_MODULES_FILE"
+INSTALLED_PACKAGES_FILE="${TEMP_DIR}/installed_$$.txt"
+: > "$INSTALLED_PACKAGES_FILE"
 
-for scan_dir in $SCAN_DIRS; do
-    if [ -d "$scan_dir" ]; then
+# Enable verbose mode if requested
+VERBOSE="${VERBOSE:-false}"
+
+if [ "$VERBOSE" = "true" ]; then
+    echo "Scanning mode: $SEARCH_MODE" >&2
+    echo "Searching in: $SCAN_DIRS" >&2
+fi
+
+if [ "$SEARCH_MODE" = "lockfile" ]; then
+    # FAST MODE: Find and parse package-lock.json files
+    [ "$VERBOSE" = "true" ] && echo "Finding package-lock.json files..." >&2
+
+    for scan_dir in $SCAN_DIRS; do
+        [ ! -d "$scan_dir" ] && continue
+
+        # Find package-lock.json files (much faster than scanning node_modules)
+        find "$scan_dir" -maxdepth "$MAX_DEPTH" -name "package-lock.json" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -not -path "*/.npm/*" \
+            -not -path "*/.cache/*" \
+            -not -path "*/.Trash/*" \
+            -not -path "*/Library/*" \
+            -type f -print 2>/dev/null | while IFS= read -r lockfile; do
+
+            [ "$VERBOSE" = "true" ] && echo "  Parsing: $lockfile" >&2
+            parse_lockfile "$lockfile" >> "$INSTALLED_PACKAGES_FILE"
+        done
+    done
+
+    # Also check package.json files that don't have lockfiles
+    [ "$VERBOSE" = "true" ] && echo "Finding package.json files without lockfiles..." >&2
+    for scan_dir in $SCAN_DIRS; do
+        [ ! -d "$scan_dir" ] && continue
+
+        find "$scan_dir" -maxdepth "$MAX_DEPTH" -name "package.json" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -not -path "*/.npm/*" \
+            -not -path "*/.cache/*" \
+            -not -path "*/.Trash/*" \
+            -not -path "*/Library/*" \
+            -type f -print 2>/dev/null | while IFS= read -r pkg_json; do
+
+            # Only parse if no lockfile exists
+            pkg_dir=$(dirname "$pkg_json")
+            if [ ! -f "$pkg_dir/package-lock.json" ] && \
+               [ ! -f "$pkg_dir/yarn.lock" ] && \
+               [ ! -f "$pkg_dir/pnpm-lock.yaml" ]; then
+                [ "$VERBOSE" = "true" ] && echo "  Parsing: $pkg_json" >&2
+                parse_package_json "$pkg_json" >> "$INSTALLED_PACKAGES_FILE"
+            fi
+        done
+    done
+else
+    # SLOW MODE: Original method scanning node_modules
+    [ "$VERBOSE" = "true" ] && echo "Finding node_modules directories (slow mode)..." >&2
+
+    NODE_MODULES_FILE="${TEMP_DIR}/node_modules_$$.txt"
+    : > "$NODE_MODULES_FILE"
+
+    for scan_dir in $SCAN_DIRS; do
+        [ ! -d "$scan_dir" ] && continue
+
         find "$scan_dir" -maxdepth "$MAX_DEPTH" \
             \( -name "node_modules" -type d -print \) -o \
             \( -type d \( -name ".Trash" -o -name "Library" -o -name ".git" -o -name ".npm" -o -name ".cache" \) -prune \) \
             2>/dev/null >> "$NODE_MODULES_FILE"
-    fi
-done
-
-# Build a list of all installed package:version pairs with their paths
-# This collects all packages in one pass, then does a single grep
-INSTALLED_PACKAGES_FILE="${TEMP_DIR}/installed.txt"
-: > "$INSTALLED_PACKAGES_FILE"
-
-while IFS= read -r node_modules_path; do
-    [ -z "$node_modules_path" ] && continue
-    [ ! -d "$node_modules_path" ] && continue
-
-    # Check non-scoped packages - use single awk call to extract version
-    for pkg_dir in "$node_modules_path"/*/; do
-        [ ! -d "$pkg_dir" ] && continue
-        pkg_name=$(basename "$pkg_dir")
-        case "$pkg_name" in @*|.bin|.cache) continue ;; esac
-
-        pkg_json="${pkg_dir}package.json"
-        [ ! -f "$pkg_json" ] && continue
-
-        # Fast version extraction with awk
-        installed_version=$(awk -F'"' '/"version"/{print $4; exit}' "$pkg_json" 2>/dev/null)
-        [ -z "$installed_version" ] && continue
-
-        echo "${pkg_name}:${installed_version}	${pkg_dir}" >> "$INSTALLED_PACKAGES_FILE"
     done
 
-    # Check scoped packages (@scope/package)
-    for scope_dir in "$node_modules_path"/@*/; do
-        [ ! -d "$scope_dir" ] && continue
-        scope_name=$(basename "$scope_dir")
+    while IFS= read -r node_modules_path; do
+        [ -z "$node_modules_path" ] && continue
+        [ ! -d "$node_modules_path" ] && continue
 
-        for pkg_dir in "$scope_dir"*/; do
+        [ "$VERBOSE" = "true" ] && echo "  Scanning: $node_modules_path" >&2
+
+        # Check non-scoped packages
+        for pkg_dir in "$node_modules_path"/*/; do
             [ ! -d "$pkg_dir" ] && continue
             pkg_name=$(basename "$pkg_dir")
-            full_pkg_name="${scope_name}/${pkg_name}"
+            case "$pkg_name" in @*|.bin|.cache) continue ;; esac
 
             pkg_json="${pkg_dir}package.json"
             [ ! -f "$pkg_json" ] && continue
@@ -1149,34 +1297,60 @@ while IFS= read -r node_modules_path; do
             installed_version=$(awk -F'"' '/"version"/{print $4; exit}' "$pkg_json" 2>/dev/null)
             [ -z "$installed_version" ] && continue
 
-            echo "${full_pkg_name}:${installed_version}	${pkg_dir}" >> "$INSTALLED_PACKAGES_FILE"
+            echo "${pkg_name}:${installed_version}	${pkg_dir}" >> "$INSTALLED_PACKAGES_FILE"
         done
-    done
-done < "$NODE_MODULES_FILE"
+
+        # Check scoped packages
+        for scope_dir in "$node_modules_path"/@*/; do
+            [ ! -d "$scope_dir" ] && continue
+            scope_name=$(basename "$scope_dir")
+
+            for pkg_dir in "$scope_dir"*/; do
+                [ ! -d "$pkg_dir" ] && continue
+                pkg_name=$(basename "$pkg_dir")
+                full_pkg_name="${scope_name}/${pkg_name}"
+
+                pkg_json="${pkg_dir}package.json"
+                [ ! -f "$pkg_json" ] && continue
+
+                installed_version=$(awk -F'"' '/"version"/{print $4; exit}' "$pkg_json" 2>/dev/null)
+                [ -z "$installed_version" ] && continue
+
+                echo "${full_pkg_name}:${installed_version}	${pkg_dir}" >> "$INSTALLED_PACKAGES_FILE"
+            done
+        done
+    done < "$NODE_MODULES_FILE"
+
+    rm -f "$NODE_MODULES_FILE"
+fi
 
 # Use fgrep to find all matches in ONE call (much faster than per-package grep)
-FOUND_FILE="${TEMP_DIR}/found_packages.txt"
+FOUND_FILE="${TEMP_DIR}/found_packages_$$.txt"
 : > "$FOUND_FILE"
 
+[ "$VERBOSE" = "true" ] && echo "Checking for malicious packages..." >&2
+
 # Extract just the package:version keys and find matches
-cut -f1 "$INSTALLED_PACKAGES_FILE" | fgrep -xf "$MALICIOUS_LIST_FILE" > "${TEMP_DIR}/matched_keys.txt" 2>/dev/null || true
+if [ -s "$INSTALLED_PACKAGES_FILE" ]; then
+    cut -f1 "$INSTALLED_PACKAGES_FILE" | fgrep -xf "$MALICIOUS_LIST_FILE" > "${TEMP_DIR}/matched_keys_$$.txt" 2>/dev/null || true
 
-# For each matched key, find the full line with path and output JSON
-if [ -s "${TEMP_DIR}/matched_keys.txt" ]; then
-    while IFS= read -r matched_key; do
-        # Find the line with this key in installed packages
-        pkg_line=$(grep -F "$matched_key	" "$INSTALLED_PACKAGES_FILE" | head -1)
-        [ -z "$pkg_line" ] && continue
+    # For each matched key, find the full line with path and output JSON
+    if [ -s "${TEMP_DIR}/matched_keys_$$.txt" ]; then
+        while IFS= read -r matched_key; do
+            # Find the line with this key in installed packages
+            pkg_line=$(grep -F "$matched_key	" "$INSTALLED_PACKAGES_FILE" | head -1)
+            [ -z "$pkg_line" ] && continue
 
-        pkg_path=$(echo "$pkg_line" | cut -f2)
-        pkg_name="${matched_key%:*}"
-        pkg_version="${matched_key##*:}"
-        escaped_pkg=$(printf '%s' "$pkg_name" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        escaped_path=$(printf '%s' "$pkg_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        echo "{\"package\":\"${escaped_pkg}\",\"version\":\"${pkg_version}\",\"path\":\"${escaped_path}\"}"
-    done < "${TEMP_DIR}/matched_keys.txt" > "$FOUND_FILE"
+            pkg_path=$(echo "$pkg_line" | cut -f2)
+            pkg_name="${matched_key%:*}"
+            pkg_version="${matched_key##*:}"
+            escaped_pkg=$(printf '%s' "$pkg_name" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            escaped_path=$(printf '%s' "$pkg_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            echo "{\"package\":\"${escaped_pkg}\",\"version\":\"${pkg_version}\",\"path\":\"${escaped_path}\"}"
+        done < "${TEMP_DIR}/matched_keys_$$.txt" > "$FOUND_FILE"
+    fi
+    rm -f "${TEMP_DIR}/matched_keys_$$.txt"
 fi
-rm -f "${TEMP_DIR}/matched_keys.txt"
 
 # Read results
 FOUND_PACKAGES=""
@@ -1186,10 +1360,21 @@ if [ -s "$FOUND_FILE" ]; then
     FOUND_COUNT=$(wc -l < "$FOUND_FILE" | tr -d ' ')
 fi
 
+# Get total count before cleanup
+TOTAL_PACKAGES=$(wc -l < "$INSTALLED_PACKAGES_FILE" 2>/dev/null | tr -d ' ')
+
 # Cleanup temp files
-rm -f "$MALICIOUS_LIST_FILE" "$NODE_MODULES_FILE" "$INSTALLED_PACKAGES_FILE" "$FOUND_FILE"
+rm -f "$MALICIOUS_LIST_FILE" "$INSTALLED_PACKAGES_FILE" "$FOUND_FILE"
 
 # --- Output Result ---
+
+if [ "$VERBOSE" = "true" ]; then
+    echo "" >&2
+    echo "Scan complete!" >&2
+    echo "Total packages checked: $TOTAL_PACKAGES" >&2
+    echo "Malicious packages found: $FOUND_COUNT" >&2
+    echo "" >&2
+fi
 
 if [ "$FOUND_COUNT" -eq 0 ] || [ -z "$FOUND_PACKAGES" ]; then
     # No malicious packages found - output clean status
