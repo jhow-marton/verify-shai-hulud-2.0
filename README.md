@@ -120,8 +120,9 @@ CLEAN
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - Standard shell utilities (sh, find, grep, awk, sed)
+- Linux only: `/sys/class/dmi/id/product_serial` or `dmidecode` (optional, for serial number detection)
 
 ## How It Works
 

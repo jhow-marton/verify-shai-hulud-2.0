@@ -1196,8 +1196,27 @@ parse_package_json() {
 
 # --- Main Logic ---
 
-# Get machine identifier
-SERIAL_NUMBER=$(/usr/sbin/ioreg -l | grep IOPlatformSerialNumber | sed 's/.*"\(.*\)"/\1/' 2>/dev/null || echo "unknown")
+# Get machine identifier (cross-platform)
+get_serial_number() {
+    # Detect OS and get serial number accordingly
+    if [ "$(uname)" = "Darwin" ]; then
+        # macOS
+        /usr/sbin/ioreg -l | grep IOPlatformSerialNumber | sed 's/.*"\(.*\)"/\1/' 2>/dev/null || echo "unknown"
+    elif [ "$(uname)" = "Linux" ]; then
+        # Linux - try multiple methods
+        if [ -f /sys/class/dmi/id/product_serial ]; then
+            cat /sys/class/dmi/id/product_serial 2>/dev/null || echo "unknown"
+        elif command -v dmidecode >/dev/null 2>&1; then
+            dmidecode -s system-serial-number 2>/dev/null || echo "unknown"
+        else
+            echo "unknown"
+        fi
+    else
+        echo "unknown"
+    fi
+}
+
+SERIAL_NUMBER=$(get_serial_number)
 HOSTNAME=$(hostname)
 SCAN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
