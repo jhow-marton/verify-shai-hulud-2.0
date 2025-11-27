@@ -34,7 +34,3 @@ Edit the script to customize:
 
 - macOS
 - Standard shell utilities (find, grep, awk, sed)
-
-## Deployment
-
-This script is designed to be deployed via Kandji as a Custom Audit Script.
