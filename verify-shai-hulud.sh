@@ -1091,12 +1091,12 @@ SCAN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # Write malicious packages list to temp file for fast grep lookup
 TEMP_DIR="${TMPDIR:-/tmp}"
-MALICIOUS_LIST_FILE="${TEMP_DIR}/kandji_malicious_list.txt"
+MALICIOUS_LIST_FILE="${TEMP_DIR}/malicious_list.txt"
 echo "$PACKAGE_LIST" > "$MALICIOUS_LIST_FILE"
 
 # Find all node_modules directories
 # Use -prune to skip searching inside node_modules and other unneeded directories
-NODE_MODULES_FILE="${TEMP_DIR}/kandji_node_modules.txt"
+NODE_MODULES_FILE="${TEMP_DIR}/node_modules.txt"
 : > "$NODE_MODULES_FILE"
 
 for scan_dir in $SCAN_DIRS; do
@@ -1110,7 +1110,7 @@ done
 
 # Build a list of all installed package:version pairs with their paths
 # This collects all packages in one pass, then does a single grep
-INSTALLED_PACKAGES_FILE="${TEMP_DIR}/kandji_installed.txt"
+INSTALLED_PACKAGES_FILE="${TEMP_DIR}/installed.txt"
 : > "$INSTALLED_PACKAGES_FILE"
 
 while IFS= read -r node_modules_path; do
@@ -1155,11 +1155,11 @@ while IFS= read -r node_modules_path; do
 done < "$NODE_MODULES_FILE"
 
 # Use fgrep to find all matches in ONE call (much faster than per-package grep)
-FOUND_FILE="${TEMP_DIR}/kandji_found_packages.txt"
+FOUND_FILE="${TEMP_DIR}/found_packages.txt"
 : > "$FOUND_FILE"
 
 # Extract just the package:version keys and find matches
-cut -f1 "$INSTALLED_PACKAGES_FILE" | fgrep -xf "$MALICIOUS_LIST_FILE" > "${TEMP_DIR}/kandji_matched_keys.txt" 2>/dev/null || true
+cut -f1 "$INSTALLED_PACKAGES_FILE" | fgrep -xf "$MALICIOUS_LIST_FILE" > "${TEMP_DIR}/matched_keys.txt" 2>/dev/null || true
 
 # For each matched key, find the full line with path and output JSON
 if [ -s "${TEMP_DIR}/kandji_matched_keys.txt" ]; then
@@ -1174,9 +1174,9 @@ if [ -s "${TEMP_DIR}/kandji_matched_keys.txt" ]; then
         escaped_pkg=$(printf '%s' "$pkg_name" | sed 's/\\/\\\\/g; s/"/\\"/g')
         escaped_path=$(printf '%s' "$pkg_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
         echo "{\"package\":\"${escaped_pkg}\",\"version\":\"${pkg_version}\",\"path\":\"${escaped_path}\"}"
-    done < "${TEMP_DIR}/kandji_matched_keys.txt" > "$FOUND_FILE"
+    done < "${TEMP_DIR}/matched_keys.txt" > "$FOUND_FILE"
 fi
-rm -f "${TEMP_DIR}/kandji_matched_keys.txt"
+rm -f "${TEMP_DIR}/matched_keys.txt"
 
 # Read results
 FOUND_PACKAGES=""
@@ -1190,7 +1190,6 @@ fi
 rm -f "$MALICIOUS_LIST_FILE" "$NODE_MODULES_FILE" "$INSTALLED_PACKAGES_FILE" "$FOUND_FILE"
 
 # --- Output Result ---
-# Kandji expects the last line of stdout to be the Custom Attribute value
 
 if [ "$FOUND_COUNT" -eq 0 ] || [ -z "$FOUND_PACKAGES" ]; then
     # No malicious packages found - output clean status
