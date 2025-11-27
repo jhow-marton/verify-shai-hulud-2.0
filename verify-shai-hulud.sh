@@ -1,21 +1,5 @@
 #!/bin/sh
 
-###############################################################################
-# Kandji Audit Script: Detect Sha1-Hulud Compromised NPM Packages
-#
-# NOTE: Uses /bin/sh for macOS compatibility (bash 3.x doesn't support
-#       associative arrays). All bash-specific syntax has been removed.
-#
-# Purpose: Scans for malicious/compromised npm packages from the Sha1-Hulud
-#          supply chain attack and reports findings via Kandji Custom Attribute
-#
-# Output:
-#   - If NO matches found: Outputs "CLEAN" (silent success)
-#   - If matches found: Outputs JSON with machine info and found packages
-#
-# Deploy via: Kandji > Library > Custom Scripts > Audit Script
-###############################################################################
-
 # --- Configuration ---
 # Directories to scan (space-separated). Add more paths as needed.
 SCAN_DIRS="/Users /Applications /opt /var"
